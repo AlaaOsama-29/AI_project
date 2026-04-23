@@ -1,12 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import json
 import threading
-from pathlib import Path
 import uuid
 
 from question_delivery import run_interview
-from shared import answers_store, answers_lock
+from shared import answers_store, answers_lock, sessions_store
 
 app = FastAPI()
 
@@ -17,7 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-STATE_FILE = "state.json"
 LOG_FILE   = "interview_log.txt"
 
 # ─── START INTERVIEW ──────────────────────────────────────
@@ -39,11 +36,20 @@ def start_interview(student_name: str, topic: str = "Python"):
 # ─── GET STATE ────────────────────────────────────────────
 @app.get("/state/{session_id}")
 def get_state(session_id: str):
-    from shared import sessions_store
     state = sessions_store.get(session_id)
     if state:
         return state
     return {"status": "not_found"}
+
+
+def _latest_session_for_student(student_name: str):
+    if not student_name:
+        return None
+    matches = [s for s in sessions_store.values() if s.get("student_name") == student_name]
+    if not matches:
+        return None
+    latest = max(matches, key=lambda s: s.get("timestamp", ""))
+    return latest.get("session_id")
 
 # ─── SUBMIT ANSWER ────────────────────────────────────────
 @app.post("/answer")
@@ -52,12 +58,14 @@ def submit_answer(student_name: str = None, session_id: str = None, answer: str 
     if not session_id and not student_name:
         return {"error": "No identifier provided"}
 
-    key = session_id or student_name
+    resolved_session = session_id or _latest_session_for_student(student_name)
+    if not resolved_session:
+        return {"error": "No active session found for this student"}
 
     with answers_lock:
-        answers_store[key] = answer.strip()
+        answers_store[resolved_session] = answer.strip()
 
-    return {"message": "Answer received"}
+    return {"message": "Answer received", "session_id": resolved_session}
 # ─── RESULTS ─────────────────────────────────────────────
 @app.get("/results/{student_name}")
 def get_results(student_name: str):
@@ -66,7 +74,7 @@ def get_results(student_name: str):
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split(" | ")
-                if len(parts) >= 7 and parts[1] == student_name:
+                if len(parts) >= 9 and parts[1] == student_name:
                     results.append({
                         "timestamp": parts[0],
                         "student": parts[1],

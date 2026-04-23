@@ -1,8 +1,8 @@
 import time
-import sys
 import threading
 import json
 import os
+import sys
 import math
 import httpx
 import re
@@ -20,6 +20,18 @@ FAST_THRESHOLD = 10
 SLOW_THRESHOLD = 20
 LEVELS         = ["Easy", "Medium", "Hard"]
 
+
+def _normalize_api_key(raw):
+    """Strip quotes, BOM/zero-width chars, and accidental whitespace/newlines."""
+    if not raw:
+        return ""
+    s = str(raw).strip().strip("\"'")
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\xa0"):
+        s = s.replace(ch, "")
+    s = "".join(s.split())
+    return s.strip()
+
+
 def get_time_limit(level):
     if level == "Easy":
         return 20
@@ -28,19 +40,56 @@ def get_time_limit(level):
     else:
         return 30
 
-# ─── Claude via OpenRouter Setup ──────────────────────────
-# Support either OpenRouter-style or Anthropic-style env var names.
-ANTHROPIC_API_KEY = (
-    os.getenv("OPENROUTER_API_KEY")
-    or os.getenv("ANTHROPIC_API_KEY")
-)
-client = bool(ANTHROPIC_API_KEY)
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-haiku")
+# ─── AI backends (OpenRouter OR Anthropic direct) ─────────
+def _is_openrouter_key(k: str) -> bool:
+    return bool(k) and (k.startswith("sk-or-v1-") or k.startswith("sk-or-"))
 
-if client:
-    print("  [AI]  Claude ready ✅")
+
+def _looks_like_anthropic_console_key(k: str) -> bool:
+    return bool(k) and (k.startswith("sk-ant-api") or k.startswith("sk-ant-"))
+
+
+_cand_or = _normalize_api_key(os.getenv("OPENROUTER_API_KEY"))
+_cand_an = _normalize_api_key(os.getenv("ANTHROPIC_API_KEY"))
+
+OPENROUTER_API_KEY = _cand_or
+ANTHROPIC_API_KEY = ""
+
+if _cand_an:
+    if _is_openrouter_key(_cand_an):
+        if not OPENROUTER_API_KEY:
+            OPENROUTER_API_KEY = _cand_an
+            print(
+                "  [INFO]  Key in ANTHROPIC_API_KEY is an OpenRouter key — "
+                "using it for OpenRouter (put it in OPENROUTER_API_KEY to avoid confusion)."
+            )
+        elif OPENROUTER_API_KEY != _cand_an:
+            print(
+                "  [WARN]  ANTHROPIC_API_KEY looks like OpenRouter but OPENROUTER_API_KEY "
+                "is already set — ignoring ANTHROPIC_API_KEY for routing."
+            )
+    elif _looks_like_anthropic_console_key(_cand_an):
+        if not OPENROUTER_API_KEY:
+            ANTHROPIC_API_KEY = _cand_an
+    else:
+        # Unknown prefix: try Anthropic first (old keys); OpenRouter wins if both set above
+        if not OPENROUTER_API_KEY:
+            ANTHROPIC_API_KEY = _cand_an
+
+has_api_key = bool(OPENROUTER_API_KEY or ANTHROPIC_API_KEY)
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-haiku")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
+ANTHROPIC_API_VERSION = os.getenv("ANTHROPIC_API_VERSION", "2023-06-01")
+
+if OPENROUTER_API_KEY and ANTHROPIC_API_KEY:
+    print("  [INFO]  Both OPENROUTER_API_KEY and Anthropic console key set — using OpenRouter.")
+
+if OPENROUTER_API_KEY:
+    print("  [AI]  Claude ready ✅ (OpenRouter)")
+elif ANTHROPIC_API_KEY:
+    print("  [AI]  Claude ready ✅ (Anthropic API)")
 else:
-    print("  [WARN]  No API key found — using smart random.")
+    print("  [WARN]  No API keys — using fallback questions.")
 
 # ─── Terminal UI ──────────────────────────────────────────
 RESET  = "\033[0m"
@@ -67,6 +116,16 @@ def _log(tag, text):
     }
     c = tag_colors.get(tag, WHITE)
     print(f"  {c}[{tag}]{RESET}  {text}")
+
+def _wants_repeat(answer: str) -> bool:
+    """User must submit with Enter; 'rrr' still counts as repeat request."""
+    s = (answer or "").strip().lower()
+    if not s:
+        return False
+    if s in ("r", "repeat", "again"):
+        return True
+    return bool(s) and set(s) == {"r"}
+
 
 def _progress(current, total):
     filled = round(current / total * 24)
@@ -95,6 +154,128 @@ def _question_card(q_num, total, level, question, arrow=""):
     print(f"  {DIM}{'─' * width}{RESET}\n")
 
 # ─── AI Question Generation ───────────────────────────────
+def _call_openrouter_chat(prompt: str) -> str:
+    referer = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost")
+    app_title = os.getenv("OPENROUTER_APP_TITLE", "Interview App")
+    resp = httpx.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": referer,
+            "X-Title": app_title,
+        },
+        json={
+            "model": OPENROUTER_MODEL,
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=httpx.Timeout(20.0, connect=10.0),
+    )
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+            err = data.get("error", {}).get("message", "Unknown API error")
+        except ValueError:
+            err = f"Non-JSON API error: {resp.text[:200]}"
+        _log("WARN", f"OpenRouter {resp.status_code}: {err}")
+        if resp.status_code == 401:
+            _log("WARN", "Check OPENROUTER_API_KEY at https://openrouter.ai/keys")
+        raise RuntimeError(err)
+    try:
+        data = resp.json()
+    except ValueError:
+        _log("WARN", "OpenRouter returned non-JSON content")
+        raise RuntimeError("Invalid JSON response from model API")
+    choices = data.get("choices")
+    if not choices:
+        err = data.get("error", {}).get("message", "No choices returned")
+        _log("WARN", f"OpenRouter response issue: {err}")
+        raise RuntimeError(err)
+    return choices[0].get("message", {}).get("content", "").strip()
+
+
+def _anthropic_key_auth_hints():
+    k = ANTHROPIC_API_KEY or ""
+    if k.startswith("sk-or-v1-") or k.startswith("sk-or-"):
+        print(
+            "  [WARN]  This key looks like OpenRouter — use OPENROUTER_API_KEY=... "
+            "instead of ANTHROPIC_API_KEY."
+        )
+    elif k and not (k.startswith("sk-ant-") or k.startswith("sk-ant-api")):
+        print(
+            f"  [WARN]  Unusual Anthropic key prefix (first 12 chars): {k[:12]!r} — "
+            "confirm you copied an API key from console.anthropic.com."
+        )
+    print(
+        "  [INFO]  Anthropic keys: https://console.anthropic.com/ → API Keys "
+        "(regenerate if 401 persists; check no extra spaces in .env)."
+    )
+
+
+def _call_anthropic_messages(prompt: str) -> str:
+    resp = httpx.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": ANTHROPIC_MODEL,
+            "max_tokens": 200,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=httpx.Timeout(20.0, connect=10.0),
+    )
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+            err_obj = data.get("error")
+            if isinstance(err_obj, dict):
+                err = err_obj.get("message", str(err_obj))
+            else:
+                err = str(err_obj or data)
+        except ValueError:
+            err = f"Non-JSON API error: {resp.text[:200]}"
+        _log("WARN", f"Anthropic {resp.status_code}: {err}")
+        if resp.status_code == 401:
+            _anthropic_key_auth_hints()
+        raise RuntimeError(err)
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError("Invalid JSON response from Anthropic API")
+    parts = []
+    for block in data.get("content", []):
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "".join(parts).strip()
+
+
+def _parse_model_question_response(text: str):
+    if not text:
+        return None
+    question_line = ""
+    reason_line = ""
+    for line in text.splitlines():
+        if line.strip().lower().startswith("question:"):
+            question_line = line.split(":", 1)[1].strip()
+        elif line.strip().lower().startswith("reason:"):
+            reason_line = line.split(":", 1)[1].strip()
+    if question_line:
+        if reason_line:
+            _log("AI", reason_line)
+        return question_line, reason_line
+    fallback_text = next(
+        (ln.strip("- ").strip() for ln in text.splitlines() if ln.strip()),
+        "",
+    )
+    if fallback_text:
+        return fallback_text, "Model response parsed without QUESTION/REASON tags"
+    return None
+
+
 def ai_generate_question(level, history, results, topic="Python"):
     history_str = ", ".join(history) if history else "None yet"
     performance = ", ".join([
@@ -109,6 +290,25 @@ def ai_generate_question(level, history, results, topic="Python"):
                        "What is a dictionary?", "What is exception handling?"],
             "Hard":   ["What is a generator?", "What is multithreading?", "What is a closure?",
                        "What is a metaclass?", "What are design patterns?"]
+        },
+        "Java": {
+            "Easy":   ["What is a class in Java?", "What is a method?", "What is JVM?",
+                       "What is a constructor?", "What is an interface?"],
+            "Medium": ["What is method overloading?", "What is inheritance?",
+                       "What is exception handling in Java?", "What is encapsulation?",
+                       "What is the difference between ArrayList and LinkedList?"],
+            "Hard":   ["What is the Java memory model?", "What is garbage collection?",
+                       "What is multithreading in Java?", "What is synchronization?",
+                       "What is the difference between HashMap and ConcurrentHashMap?"]
+        },
+        "C++": {
+            "Easy":   ["What is a pointer?", "What is a reference?", "What is a class?",
+                       "What is a header file?", "What is a constructor?"],
+            "Medium": ["What is polymorphism in C++?", "What is function overloading?",
+                       "What is the difference between stack and heap?",
+                       "What is STL?", "What is a virtual function?"],
+            "Hard":   ["What is RAII?", "What is move semantics?", "What is smart pointer?",
+                       "What is undefined behavior?", "What is template metaprogramming?"]
         },
         "SQL": {
             "Easy":   ["What is a PRIMARY KEY?", "What is SQL?", "What is SELECT?",
@@ -134,6 +334,97 @@ def ai_generate_question(level, history, results, topic="Python"):
             "Hard":   ["What is microservices?", "What is load balancing?", "What is Docker?",
                        "What is CI/CD?", "What is a message queue?"]
         },
+        "DevOps and Cloud": {
+            "Easy":   ["What is cloud computing?", "What is Docker?",
+                       "What is a virtual machine?", "What is CI/CD?", "What is deployment?"],
+            "Medium": ["What is Kubernetes?", "What is Infrastructure as Code?",
+                       "What is auto-scaling?", "What is blue-green deployment?",
+                       "What is observability?"],
+            "Hard":   ["What is eventual consistency in distributed systems?",
+                       "What is a service mesh?", "What is canary deployment strategy?",
+                       "What is zero-downtime deployment?", "What is chaos engineering?"]
+        },
+        "Machine Learning": {
+            "Easy":   ["What is machine learning?", "What is a dataset?",
+                       "What is training data?", "What is a feature?", "What is classification?"],
+            "Medium": ["What is overfitting?", "What is train-validation-test split?",
+                       "What is precision vs recall?", "What is gradient descent?",
+                       "What is regularization?"],
+            "Hard":   ["What is bias-variance tradeoff?", "What is cross-validation?",
+                       "What is batch normalization?", "What is explainability in ML?",
+                       "What is the difference between bagging and boosting?"]
+        },
+        "Data Science and Statistics": {
+            "Easy":   ["What is mean?", "What is median?", "What is standard deviation?",
+                       "What is a histogram?", "What is correlation?"],
+            "Medium": ["What is hypothesis testing?", "What is p-value?",
+                       "What is confidence interval?", "What is sampling bias?",
+                       "What is linear regression?"],
+            "Hard":   ["What is multicollinearity?", "What is Bayesian inference?",
+                       "What is Type I vs Type II error?", "What is heteroscedasticity?",
+                       "What is A/B test power analysis?"]
+        },
+        "Cybersecurity": {
+            "Easy":   ["What is encryption?", "What is a firewall?", "What is phishing?",
+                       "What is malware?", "What is authentication?"],
+            "Medium": ["What is SQL injection?", "What is XSS?",
+                       "What is the principle of least privilege?", "What is hashing with salt?",
+                       "What is multi-factor authentication?"],
+            "Hard":   ["What is zero trust architecture?", "What is a man-in-the-middle attack?",
+                       "What is CSRF protection?", "What is public key infrastructure?",
+                       "What is threat modeling?"]
+        },
+        "Operating Systems": {
+            "Easy":   ["What is a process?", "What is a thread?", "What is a file system?",
+                       "What is RAM?", "What is a kernel?"],
+            "Medium": ["What is context switching?", "What is virtual memory?",
+                       "What is deadlock?", "What is scheduling?",
+                       "What is the difference between process and thread?"],
+            "Hard":   ["What is paging vs segmentation?", "What is starvation?",
+                       "What is semaphore vs mutex?", "What is copy-on-write?",
+                       "What is the producer-consumer problem?"]
+        },
+        "Computer Networks": {
+            "Easy":   ["What is an IP address?", "What is a router?",
+                       "What is DNS?", "What is HTTP?", "What is a packet?"],
+            "Medium": ["What is TCP vs UDP?", "What is subnet mask?",
+                       "What is latency?", "What is TLS?", "What is NAT?"],
+            "Hard":   ["What is the TCP three-way handshake?",
+                       "What is congestion control?", "What is CIDR?",
+                       "What is BGP?", "What is load balancing at network layer?"]
+        },
+        "Mobile Development (Android/iOS)": {
+            "Easy":   ["What is a mobile app lifecycle?", "What is an activity in Android?",
+                       "What is Swift used for?", "What is a mobile SDK?",
+                       "What is app permissions?"],
+            "Medium": ["What is state management in mobile apps?",
+                       "What is local storage on mobile?", "What is push notification?",
+                       "What is responsive layout on mobile?", "What is API integration in apps?"],
+            "Hard":   ["What is dependency injection in mobile development?",
+                       "What is offline-first architecture?", "What is app sandboxing?",
+                       "What is memory leak in mobile apps?", "What is deep linking?"]
+        },
+        "Software Testing and QA": {
+            "Easy":   ["What is a unit test?", "What is a bug?",
+                       "What is regression testing?", "What is test case?",
+                       "What is quality assurance?"],
+            "Medium": ["What is integration testing?", "What is mocking?",
+                       "What is code coverage?", "What is end-to-end testing?",
+                       "What is test automation?"],
+            "Hard":   ["What is flaky test?", "What is contract testing?",
+                       "What is mutation testing?", "What is shift-left testing?",
+                       "What is risk-based testing?"]
+        },
+        "System Design": {
+            "Easy":   ["What is scalability?", "What is availability?",
+                       "What is a database?", "What is caching?", "What is a load balancer?"],
+            "Medium": ["What is horizontal vs vertical scaling?",
+                       "What is eventual consistency?", "What is sharding?",
+                       "What is message queue?", "What is CDN?"],
+            "Hard":   ["What is CAP theorem?", "What is distributed consensus?",
+                       "What is idempotency?", "What is rate limiting strategy?",
+                       "What is backpressure in distributed systems?"]
+        },
         "Data Structures and Algorithms": {
             "Easy":   ["What is an array?", "What is a stack?", "What is a queue?",
                        "What is a linked list?", "What is Big O notation?"],
@@ -143,15 +434,38 @@ def ai_generate_question(level, history, results, topic="Python"):
                        "What is memoization?", "What is a trie?"]
         }
     }
-    fallback_questions = fallback_by_topic.get(topic, fallback_by_topic["Python"])
+    generic_fallback_by_level = {
+        "Easy": [
+            f"What is {topic}?",
+            f"Why is {topic} important?",
+            f"What are the basic concepts of {topic}?",
+            f"When would you use {topic}?",
+            f"What problem does {topic} solve?"
+        ],
+        "Medium": [
+            f"What is the difference between two common approaches in {topic}?",
+            f"What are key challenges when working with {topic}?",
+            f"How do you evaluate a solution in {topic}?",
+            f"What best practices are used in {topic}?",
+            f"What trade-offs appear when designing with {topic}?"
+        ],
+        "Hard": [
+            f"What advanced design trade-offs exist in {topic}?",
+            f"How would you optimize performance in {topic} systems?",
+            f"What are common failure scenarios in {topic} and how do you mitigate them?",
+            f"How do scalability and reliability affect architecture choices in {topic}?",
+            f"What are the most difficult production concerns in {topic}?"
+        ]
+    }
+    fallback_questions = fallback_by_topic.get(topic, generic_fallback_by_level)
 
-    if not client:
+    if not has_api_key:
         import random
         asked = set(history)
         pool = [q for q in fallback_questions.get(level, fallback_questions["Medium"]) if q not in asked]
         if not pool:
             pool = fallback_questions.get(level, fallback_questions["Medium"])
-        return random.choice(pool), "random fallback"
+        return random.choice(pool), "random fallback (missing API key)"
 
     prompt = f"""You are an AI technical interviewer assistant.
 
@@ -163,7 +477,7 @@ Rules:
 - The question must be about {topic} concepts
 - Must match the {level} difficulty level
 - Must be different from questions already asked
-- Keep it SHORT and conceptual (one sentence)
+- Keep it SHORT: one sentence only, at most 25 words (no multi-part homework-style prompts)
 - Ask about definitions, differences, or explanations — NOT "write code"
 
 Reply ONLY in this exact format:
@@ -172,49 +486,19 @@ REASON: <why this question suits the student>
 """
 
     try:
-        resp = httpx.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {ANTHROPIC_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": OPENROUTER_MODEL,
-                "max_tokens": 200,
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=15
-        )
-        data = resp.json()
-        if resp.status_code != 200:
-            err = data.get("error", {}).get("message", "Unknown API error")
-            _log("WARN", f"OpenRouter {resp.status_code}: {err}")
-            raise RuntimeError(err)
-
-        choices = data.get("choices")
-        if not choices:
-            err = data.get("error", {}).get("message", "No choices returned")
-            _log("WARN", f"OpenRouter response issue: {err}")
-            raise RuntimeError(err)
-
-        text = choices[0].get("message", {}).get("content", "").strip()
+        if OPENROUTER_API_KEY:
+            text = _call_openrouter_chat(prompt)
+        else:
+            text = _call_anthropic_messages(prompt)
         if not text:
-            _log("WARN", "OpenRouter returned empty content")
+            _log("WARN", "Model returned empty content")
             raise RuntimeError("Empty model response")
-        question_line = ""
-        reason_line   = ""
+        parsed = _parse_model_question_response(text)
+        if parsed:
+            return parsed
 
-        for line in text.splitlines():
-            if line.strip().lower().startswith("question:"):
-                question_line = line.split(":", 1)[1].strip()
-            elif line.strip().lower().startswith("reason:"):
-                reason_line = line.split(":", 1)[1].strip()
-
-        if question_line:
-            if reason_line:
-                _log("AI", reason_line)
-            return question_line, reason_line
-
+    except httpx.RequestError as e:
+        _log("WARN", f"Network/API request error — using fallback: {e}")
     except Exception as e:
         _log("WARN", f"Claude error — using fallback: {e}")
 
@@ -245,17 +529,48 @@ $synth.Speak("ready")
         return None
 
 def speak(spk, text):
+    if not spk:
+        return
     _log("SPEAK", text)
     try:
         import subprocess
         safe = text.replace("'", " ")
         safe = re.sub(r'[`*_#@<>{}[\]|\\]', '', safe)
         safe = re.sub(r'\s+', ' ', safe).strip()
-        ps_cmd = f"Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.SelectVoiceByHints('Male'); $s.Speak('{safe}')"
-        subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True, timeout=20)
+        if not safe:
+            return
+        # Long prompts exceed default subprocess timeout; speech is slower than read.
+        tts_max = 420
+        if len(safe) > tts_max:
+            cut = safe[:tts_max].rsplit(" ", 1)[0]
+            to_speak = f"{cut} ... Rest is on screen."
+        else:
+            to_speak = safe
+        # ~10 chars/sec speaking rate buffer; cap so one line never hangs forever.
+        timeout_sec = min(120, max(25, 18 + len(to_speak) // 8))
+        ps_cmd = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "$voices = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Gender -eq 'Male' }; "
+            "if ($voices) { $s.SelectVoice($voices[0].VoiceInfo.Name) }; "
+            f"$s.Speak('{to_speak}')"
+        )
+        subprocess.run(
+            ["powershell", "-Command", ps_cmd],
+            capture_output=True,
+            timeout=timeout_sec,
+        )
     except Exception as e:
         _log("WARN", f"TTS error: {e}")
+
 # ─── State File ───────────────────────────────────────────
+def _state_path(session_id=""):
+    safe_session = (session_id or "").strip()
+    if safe_session:
+        safe_session = re.sub(r"[^a-zA-Z0-9._-]", "_", safe_session)
+        return Path(f"state_{safe_session}.json")
+    return Path(STATE_FILE)
+
 def write_state(status, q_num=0, question="", level="", name="", session_id="", topic=""):
     from shared import sessions_store
     state = {
@@ -268,9 +583,8 @@ def write_state(status, q_num=0, question="", level="", name="", session_id="", 
         "topic":        topic,
         "timestamp":    datetime.now().isoformat(),
     }
-    # الاتنين مع بعض
     sessions_store[session_id] = state
-    Path(STATE_FILE).write_text(
+    _state_path(session_id).write_text(
         json.dumps(state, indent=2, ensure_ascii=False)
     )
 # ─── Log ──────────────────────────────────────────────────
@@ -300,7 +614,9 @@ def countdown_timer(seconds, stop_event):
 
 def timed_input_with_countdown(seconds):
     """Windows non-blocking input with live countdown."""
-    prompt = f"  {CYAN}Your answer (type 'r' to repeat):{RESET}  "
+    prompt = (
+        f"  {CYAN}Your answer (type r + Enter to repeat once):{RESET}  "
+    )
     total_seconds = max(1, int(seconds))
     start = time.perf_counter()
     typed = []
@@ -321,12 +637,17 @@ def timed_input_with_countdown(seconds):
 
         if msvcrt.kbhit():
             ch = msvcrt.getwch()
+            # Arrow / function keys send a prefix byte on Windows — consume and ignore.
+            if ch in ("\x00", "\xe0"):
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
             if ch in ("\r", "\n"):
                 print()
                 return "".join(typed), False
             if ch == "\003":
                 raise KeyboardInterrupt
-            if ch == "\b":
+            if ch in ("\b", "\x7f"):
                 if typed:
                     typed.pop()
             elif ch >= " ":
@@ -355,7 +676,7 @@ def get_answer(spk, question, q_num, level, time_limit, student_name="", session
                 answer = answers_store.pop(session_id, None)
 
             if answer is not None:
-                if answer.strip().lower() == "r":
+                if _wants_repeat(answer):
                     if repeat_count >= 1:
                         pause_start = time.perf_counter()
                         speak(spk, "No more repeats allowed.")
@@ -386,31 +707,43 @@ def get_answer(spk, question, q_num, level, time_limit, student_name="", session
                 speak(spk, "Time is up.")
                 return "", time_limit
 
+            stop_event = threading.Event()
+            timer_thread = None
             try:
-                if os.name == "nt":
+                # Fancy same-line countdown (msvcrt) often fails in IDE "Run" consoles.
+                use_fancy = (
+                    os.name == "nt"
+                    and sys.stdin.isatty()
+                    and os.getenv("INTERVIEW_FANCY_INPUT", "").lower() in ("1", "true", "yes")
+                )
+                if use_fancy:
                     answer, timed_out = timed_input_with_countdown(remaining)
                     if timed_out:
                         speak(spk, "Time is up.")
                         return "", time_limit
                 else:
-                    stop_event = threading.Event()
                     timer_thread = threading.Thread(
                         target=countdown_timer,
                         args=(remaining, stop_event),
-                        daemon=True
+                        daemon=True,
                     )
                     timer_thread.start()
-                    print(f"\n  {CYAN}Your answer (type 'r' to repeat):{RESET}  ", end="", flush=True)
-                    answer = input()
+                    print(
+                        f"\n  {CYAN}Your answer (r + Enter = repeat once, else type answer + Enter):{RESET}"
+                    )
+                    print(
+                        f"  {DIM}You must press Enter to submit — typing alone is not enough.{RESET}"
+                    )
+                    answer = input(f"  {WHITE}> {RESET}")
                 elapsed = time.perf_counter() - overall_start - paused_time
             except KeyboardInterrupt:
                 answer, elapsed = "", 0
             finally:
-                if os.name != "nt":
-                    stop_event.set()
-                    timer_thread.join()
+                stop_event.set()
+                if timer_thread is not None:
+                    timer_thread.join(timeout=2.0)
 
-            if answer.strip().lower() == "r":
+            if _wants_repeat(answer):
                 if repeat_count >= 1:
                     pause_start = time.perf_counter()
                     speak(spk, "No more repeats allowed.")
@@ -482,26 +815,46 @@ def run_interview(student_name: str = None, session_id: str = "", from_api: bool
     # ─── Topic Selection ──────────────────────────────────
     topics = {
         "1": "Python",
-        "2": "SQL",
-        "3": "Frontend (HTML, CSS, JavaScript)",
-        "4": "Backend (REST APIs, HTTP, Django/Node)",
-        "5": "Data Structures and Algorithms"
+        "2": "Java",
+        "3": "C++",
+        "4": "SQL",
+        "5": "Frontend (HTML, CSS, JavaScript)",
+        "6": "Backend (REST APIs, HTTP, Django/Node)",
+        "7": "DevOps and Cloud",
+        "8": "Machine Learning",
+        "9": "Data Science and Statistics",
+        "10": "Cybersecurity",
+        "11": "Operating Systems",
+        "12": "Computer Networks",
+        "13": "Mobile Development (Android/iOS)",
+        "14": "Software Testing and QA",
+        "15": "System Design",
+        "16": "Data Structures and Algorithms"
     }
 
     if not topic:
         print(f"\n  {DIM}Choose your topic:{RESET}")
-        print(f"  {CYAN}1{RESET}  Python")
-        print(f"  {CYAN}2{RESET}  SQL")
-        print(f"  {CYAN}3{RESET}  Frontend  (HTML / CSS / JavaScript)")
-        print(f"  {CYAN}4{RESET}  Backend   (REST APIs / Node / Django)")
-        print(f"  {CYAN}5{RESET}  Data Structures & Algorithms")
+        for key, label in topics.items():
+            print(f"  {CYAN}{key}{RESET}  {label}")
+        print(f"  {CYAN}C{RESET}  Custom topic (type your own)")
 
         while True:
-            choice = input(f"\n  {CYAN}>{RESET}  Enter number (1-5): ").strip()
+            choice = input(
+                f"\n  {CYAN}>{RESET}  Enter number (1-{len(topics)}) or C for custom: "
+            ).strip()
+            if choice.lower() == "c":
+                custom_topic = input(f"  {DIM}Enter custom topic:{RESET}  ").strip()
+                if custom_topic:
+                    topic = custom_topic
+                    break
+                print(f"  {RED}Custom topic cannot be empty.{RESET}")
+                continue
             if choice in topics:
                 topic = topics[choice]
                 break
-            print(f"  {RED}Please enter a number from 1 to 5.{RESET}")
+            print(
+                f"  {RED}Please enter a number from 1 to {len(topics)} or C for custom.{RESET}"
+            )
 
     print(f"\n  {GREEN}✓ Topic: {topic}{RESET}\n")
     speak(spk, f"Topic selected: {topic}.")
@@ -518,14 +871,17 @@ def run_interview(student_name: str = None, session_id: str = "", from_api: bool
 
         question, reason = "", ""
 
-        for _ in range(2):  # يحاول مرتين
+        for _ in range(2):
             question, reason = ai_generate_question(current_level, history, results, topic)
             if question:
                 break
 
-        # منع التكرار
-        while question in history:
+        duplicate_guard = 0
+        while question in history and duplicate_guard < 5:
             question, reason = ai_generate_question(current_level, history, results, topic)
+            duplicate_guard += 1
+        if question in history:
+            reason = f"{reason} | duplicate accepted after retries".strip(" |")
 
         level = current_level
         history.append(question)
