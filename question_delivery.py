@@ -3,12 +3,15 @@ import sys
 import threading
 import json
 import os
+import math
 import httpx
 import re
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
+if os.name == "nt":
+    import msvcrt
 
 STATE_FILE     = "state.json"
 LOG_FILE       = "interview_log.txt"
@@ -26,8 +29,13 @@ def get_time_limit(level):
         return 30
 
 # ─── Claude via OpenRouter Setup ──────────────────────────
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-client = True if ANTHROPIC_API_KEY else None
+# Support either OpenRouter-style or Anthropic-style env var names.
+ANTHROPIC_API_KEY = (
+    os.getenv("OPENROUTER_API_KEY")
+    or os.getenv("ANTHROPIC_API_KEY")
+)
+client = bool(ANTHROPIC_API_KEY)
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-haiku")
 
 if client:
     print("  [AI]  Claude ready ✅")
@@ -171,13 +179,28 @@ REASON: <why this question suits the student>
                 "Content-Type": "application/json",
             },
             json={
-                "model": "anthropic/claude-haiku-4-5",
+                "model": OPENROUTER_MODEL,
                 "max_tokens": 200,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=15
         )
-        text = resp.json()["choices"][0]["message"]["content"].strip()
+        data = resp.json()
+        if resp.status_code != 200:
+            err = data.get("error", {}).get("message", "Unknown API error")
+            _log("WARN", f"OpenRouter {resp.status_code}: {err}")
+            raise RuntimeError(err)
+
+        choices = data.get("choices")
+        if not choices:
+            err = data.get("error", {}).get("message", "No choices returned")
+            _log("WARN", f"OpenRouter response issue: {err}")
+            raise RuntimeError(err)
+
+        text = choices[0].get("message", {}).get("content", "").strip()
+        if not text:
+            _log("WARN", "OpenRouter returned empty content")
+            raise RuntimeError("Empty model response")
         question_line = ""
         reason_line   = ""
 
@@ -262,15 +285,58 @@ def save_log(name, q_num, question, level, topic, answer, elapsed, adapted, reas
 
 # ─── Countdown Timer ──────────────────────────────────────
 def countdown_timer(seconds, stop_event):
-    for remaining in range(int(seconds), 0, -1):
+    timed_out = True
+    for remaining in range(math.ceil(seconds), 0, -1):
         if stop_event.is_set():
+            timed_out = False
             break
         filled  = round((seconds - remaining) / seconds * 10)
         bar     = "█" * filled + "░" * (10 - filled)
         urgency = RED if remaining <= 10 else YELLOW if remaining <= 20 else GREEN
         print(f"  {urgency}⏱  [{bar}]  {remaining:2d}s{RESET}", flush=True)
         time.sleep(1)
-    print(f"  {DIM}⏱  [{'█' * 10}]  Done{RESET}", flush=True)
+    if timed_out:
+        print(f"  {DIM}⏱  [{'█' * 10}]  Done{RESET}", flush=True)
+
+def timed_input_with_countdown(seconds):
+    """Windows non-blocking input with live countdown."""
+    prompt = f"  {CYAN}Your answer (type 'r' to repeat):{RESET}  "
+    total_seconds = max(1, int(seconds))
+    start = time.perf_counter()
+    typed = []
+    shown_remaining = None
+
+    while True:
+        elapsed = time.perf_counter() - start
+        remaining = max(0, math.ceil(seconds - elapsed))
+
+        if remaining != shown_remaining:
+            filled = round((total_seconds - remaining) / total_seconds * 10)
+            filled = max(0, min(10, filled))
+            bar = "█" * filled + "░" * (10 - filled)
+            urgency = RED if remaining <= 10 else YELLOW if remaining <= 20 else GREEN
+            line = f"\r{prompt}{''.join(typed)}  {urgency}⏱  [{bar}]  {remaining:2d}s{RESET}"
+            print(line + " " * 8, end="", flush=True)
+            shown_remaining = remaining
+
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                print()
+                return "".join(typed), False
+            if ch == "\003":
+                raise KeyboardInterrupt
+            if ch == "\b":
+                if typed:
+                    typed.pop()
+            elif ch >= " ":
+                typed.append(ch)
+
+        if elapsed >= seconds:
+            print()
+            return "", True
+
+        time.sleep(0.03)
 
 # ─── Answer Input ─────────────────────────────────────────
 def get_answer(spk, question, q_num, level, time_limit, student_name="", session_id="", from_api=False):
@@ -281,21 +347,26 @@ def get_answer(spk, question, q_num, level, time_limit, student_name="", session
             answers_store.pop(session_id, None)
 
         start = time.perf_counter()
+        paused_time = 0.0
         repeat_count = 0
 
-        while time.perf_counter() - start < time_limit:
+        while (time.perf_counter() - start - paused_time) < time_limit:
             with answers_lock:
                 answer = answers_store.pop(session_id, None)
 
             if answer is not None:
                 if answer.strip().lower() == "r":
                     if repeat_count >= 1:
+                        pause_start = time.perf_counter()
                         speak(spk, "No more repeats allowed.")
+                        paused_time += time.perf_counter() - pause_start
                     else:
                         repeat_count += 1
+                        pause_start = time.perf_counter()
                         speak(spk, f"Question again. {question}")
+                        paused_time += time.perf_counter() - pause_start
                 else:
-                    elapsed = time.perf_counter() - start
+                    elapsed = time.perf_counter() - start - paused_time
                     return answer, elapsed
 
             time.sleep(0.3)
@@ -305,39 +376,50 @@ def get_answer(spk, question, q_num, level, time_limit, student_name="", session
 
     else:
         overall_start = time.perf_counter()
+        paused_time = 0.0
         repeat_count = 0
 
         while True:
-            remaining = time_limit - (time.perf_counter() - overall_start)
+            active_elapsed = time.perf_counter() - overall_start - paused_time
+            remaining = time_limit - active_elapsed
             if remaining <= 0:
                 speak(spk, "Time is up.")
                 return "", time_limit
 
-            stop_event = threading.Event()
-            timer_thread = threading.Thread(
-                target=countdown_timer,
-                args=(remaining, stop_event),
-                daemon=True
-            )
-            timer_thread.start()
-
-            print(f"\n  {CYAN}Your answer (type 'r' to repeat):{RESET}  ", end="", flush=True)
-
             try:
-                answer = input()
-                elapsed = time.perf_counter() - overall_start
+                if os.name == "nt":
+                    answer, timed_out = timed_input_with_countdown(remaining)
+                    if timed_out:
+                        speak(spk, "Time is up.")
+                        return "", time_limit
+                else:
+                    stop_event = threading.Event()
+                    timer_thread = threading.Thread(
+                        target=countdown_timer,
+                        args=(remaining, stop_event),
+                        daemon=True
+                    )
+                    timer_thread.start()
+                    print(f"\n  {CYAN}Your answer (type 'r' to repeat):{RESET}  ", end="", flush=True)
+                    answer = input()
+                elapsed = time.perf_counter() - overall_start - paused_time
             except KeyboardInterrupt:
                 answer, elapsed = "", 0
             finally:
-                stop_event.set()
-                timer_thread.join()
+                if os.name != "nt":
+                    stop_event.set()
+                    timer_thread.join()
 
             if answer.strip().lower() == "r":
                 if repeat_count >= 1:
+                    pause_start = time.perf_counter()
                     speak(spk, "No more repeats allowed.")
+                    paused_time += time.perf_counter() - pause_start
                 else:
                     repeat_count += 1
+                    pause_start = time.perf_counter()
                     speak(spk, f"Question again. {question}")
+                    paused_time += time.perf_counter() - pause_start
                 continue
 
             return answer, elapsed
@@ -482,7 +564,7 @@ def run_interview(student_name: str = None, session_id: str = "", from_api: bool
             "elapsed": elapsed,
         })
 
-        if elapsed > time_limit:
+        if elapsed >= time_limit:
             speak(spk, f"Time is over. You took {round(elapsed)} seconds.")
             _log("TIMER", f"{RED}Over limit{RESET}  {elapsed:.1f}s")
         else:
