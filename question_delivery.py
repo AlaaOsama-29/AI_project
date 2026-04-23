@@ -288,25 +288,59 @@ def get_answer(spk, question, q_num, level, time_limit, student_name="", session
                 answer = answers_store.pop(session_id, None)
 
             if answer is not None:
-                cleaned = answer.strip().lower()
-
-                if cleaned == "r":
+                if answer.strip().lower() == "r":
                     if repeat_count >= 1:
                         speak(spk, "No more repeats allowed.")
-                        continue
-
-                    repeat_count += 1
-                    speak(spk, f"Question again. {question}")
-                    continue
-
-
-                elapsed = time.perf_counter() - start
-                return answer, elapsed
+                    else:
+                        repeat_count += 1
+                        speak(spk, f"Question again. {question}")
+                else:
+                    elapsed = time.perf_counter() - start
+                    return answer, elapsed
 
             time.sleep(0.3)
 
         speak(spk, "Time is up.")
         return "", time_limit
+
+    else:
+        overall_start = time.perf_counter()
+        repeat_count = 0
+
+        while True:
+            remaining = time_limit - (time.perf_counter() - overall_start)
+            if remaining <= 0:
+                speak(spk, "Time is up.")
+                return "", time_limit
+
+            stop_event = threading.Event()
+            timer_thread = threading.Thread(
+                target=countdown_timer,
+                args=(remaining, stop_event),
+                daemon=True
+            )
+            timer_thread.start()
+
+            print(f"\n  {CYAN}Your answer (type 'r' to repeat):{RESET}  ", end="", flush=True)
+
+            try:
+                answer = input()
+                elapsed = time.perf_counter() - overall_start
+            except KeyboardInterrupt:
+                answer, elapsed = "", 0
+            finally:
+                stop_event.set()
+                timer_thread.join()
+
+            if answer.strip().lower() == "r":
+                if repeat_count >= 1:
+                    speak(spk, "No more repeats allowed.")
+                else:
+                    repeat_count += 1
+                    speak(spk, f"Question again. {question}")
+                continue
+
+            return answer, elapsed
 # ─── Adaptive Difficulty ──────────────────────────────────
 def get_next_level(current_level, elapsed):
     idx = LEVELS.index(current_level)
@@ -434,6 +468,9 @@ def run_interview(student_name: str = None, session_id: str = "", from_api: bool
         answer, elapsed = get_answer(spk, question, q_num, level, time_limit,
                                      student_name=name, session_id=session_id, from_api=from_api)
 
+        # ضيفي السطرين دول
+        if answer == "" and elapsed == 0:
+            break
         write_state("waiting", q_num, question, level, name, session_id, topic)
 
         current_level, arrow, adapted = get_next_level(current_level, elapsed)
