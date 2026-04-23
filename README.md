@@ -70,8 +70,10 @@ uvicorn api:app --reload
 |---|---|---|---|
 | `/start?student_name=alaa&topic=Python` | POST | Frontend | Starts the interview and returns session_id |
 | `/state/{session_id}` | GET | Frontend + Camera | Returns current interview state |
-| `/answer?student_name=alaa&answer=...` | POST | Frontend | Submits student answer |
+| `/answer?session_id=...&answer=...` | POST | Frontend | Submits student answer using session_id |
 | `/results/{student_name}` | GET | Backend | Returns student results |
+
+> ⚠️ **Important:** Use `session_id` (not `student_name`) when submitting answers via `/answer`
 
 ### Example `/start` Response
 ```json
@@ -97,12 +99,20 @@ uvicorn api:app --reload
 ```
 Status values: `idle` / `waiting` / `recording` / `done`
 
+### Example `/answer` Request
+```
+POST /answer?session_id=abc-123-xyz&answer=A decorator is a function that wraps another function
+```
+
 ### Example `/results/{student_name}` Response
 ```json
 {
   "student": "alaa",
   "results": [
     {
+      "timestamp": "2026-04-20 01:00:00",
+      "student": "alaa",
+      "topic": "Python",
       "question_num": "Q1",
       "level": "[Medium]",
       "question": "What is OOP?",
