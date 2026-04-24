@@ -16,6 +16,30 @@ app.add_middleware(
 )
 
 LOG_FILE   = "interview_log.txt"
+@app.get("/topics")
+def get_topics():
+    return {
+        "topics": [
+            {"id": "1",  "name": "Python"},
+            {"id": "2",  "name": "Java"},
+            {"id": "3",  "name": "C++"},
+            {"id": "4",  "name": "SQL"},
+            {"id": "5",  "name": "Frontend (HTML, CSS, JavaScript)"},
+            {"id": "6",  "name": "Backend (REST APIs, HTTP, Django/Node)"},
+            {"id": "7",  "name": "DevOps and Cloud"},
+            {"id": "8",  "name": "Machine Learning"},
+            {"id": "9",  "name": "Data Science and Statistics"},
+            {"id": "10", "name": "Cybersecurity"},
+            {"id": "11", "name": "Operating Systems"},
+            {"id": "12", "name": "Computer Networks"},
+            {"id": "13", "name": "Mobile Development (Android/iOS)"},
+            {"id": "14", "name": "Software Testing and QA"},
+            {"id": "15", "name": "System Design"},
+            {"id": "16", "name": "Data Structures and Algorithms"}
+        ],
+        "custom_topic_allowed": True,
+        "note": "You can pass any topic name directly in /start?topic=YourTopic"
+    }
 
 # ─── START INTERVIEW ──────────────────────────────────────
 @app.post("/start")
