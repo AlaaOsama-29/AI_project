@@ -123,3 +123,18 @@ def get_results(student_name: str):
         return {"student": student_name, "results": results}
     except Exception:
         return {"student": student_name, "results": []}
+
+@app.post("/stop/{session_id}")
+def stop_interview(session_id: str):
+    state = sessions_store.get(session_id)
+
+    if not state:
+        return {"error": "Session not found"}
+
+    # نغير الحالة
+    state["status"] = "stopped"
+
+    return {
+        "message": "Interview stopped",
+        "session_id": session_id
+    }
