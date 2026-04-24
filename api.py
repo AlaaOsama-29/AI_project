@@ -37,11 +37,23 @@ def start_interview(student_name: str, topic: str = "Python"):
 @app.get("/state/{session_id}")
 def get_state(session_id: str):
     state = sessions_store.get(session_id)
-    if state:
-        return state
-    return {"status": "not_found"}
 
+    if not state:
+        return {
+            "status": "not_found",
+            "data": None
+        }
 
+    return {
+        "status": state.get("status"),
+        "data": {
+            "question": state.get("question"),
+            "level": state.get("level"),
+            "question_num": state.get("question_num"),
+            "student_name": state.get("student_name"),
+            "topic": state.get("topic")
+        }
+    }
 def _latest_session_for_student(student_name: str):
     if not student_name:
         return None
@@ -59,13 +71,35 @@ def submit_answer(student_name: str = None, session_id: str = None, answer: str 
         return {"error": "No identifier provided"}
 
     resolved_session = session_id or _latest_session_for_student(student_name)
-    if not resolved_session:
-        return {"error": "No active session found for this student"}
 
+    if not resolved_session:
+        return {"error": "No active session found"}
+
+    state = sessions_store.get(resolved_session)
+
+    # 🛑 check لو السيشن مش موجود
+    if not state:
+        return {"error": "Session not found"}
+
+    # 🛑 check هل فعلاً مستني إجابة؟
+    if state.get("status") != "recording":
+        return {
+            "error": "Not accepting answers right now",
+            "current_status": state.get("status")
+        }
+
+    # 🛑 check لو الإجابة فاضية
+    if not answer.strip():
+        return {"error": "Empty answer not allowed"}
+
+    # ✅ تخزين الإجابة
     with answers_lock:
         answers_store[resolved_session] = answer.strip()
 
-    return {"message": "Answer received", "session_id": resolved_session}
+    return {
+        "message": "Answer received",
+        "session_id": resolved_session
+    }
 # ─── RESULTS ─────────────────────────────────────────────
 @app.get("/results/{student_name}")
 def get_results(student_name: str):

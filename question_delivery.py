@@ -9,6 +9,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
+from shared import sessions_store, answers_store, answers_lock
 load_dotenv()
 if os.name == "nt":
     import msvcrt
@@ -863,8 +864,11 @@ def run_interview(student_name: str = None, session_id: str = "", from_api: bool
     time.sleep(1)
 
     interview_start = time.perf_counter()
-
     for idx in range(total):
+        state = sessions_store.get(session_id)
+        if state and state.get("status") == "stopped":
+            _log("INFO", "Interview stopped by user")
+            break
         q_num = idx + 1
 
         _log("AI", f"Generating best {WHITE}{current_level}{RESET} question...")
