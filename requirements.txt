@@ -2,4 +2,4 @@ httpx
 python-dotenv
 fastapi
 uvicorn
-pandas
+requests
