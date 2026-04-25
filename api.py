@@ -2,49 +2,43 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import threading
 import uuid
+import os
+from datetime import datetime
 
 from question_delivery import run_interview
 from shared import answers_store, answers_lock, sessions_store
 
 app = FastAPI()
 
+_cors_env = os.getenv("CORS_ALLOW_ORIGINS", "*")
+_cors_origins = [origin.strip() for origin in _cors_env.split(",") if origin.strip()]
+if not _cors_origins:
+    _cors_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 LOG_FILE   = "interview_log.txt"
-@app.get("/topics")
-def get_topics():
-    return {
-        "topics": [
-            {"id": "1",  "name": "Python"},
-            {"id": "2",  "name": "Java"},
-            {"id": "3",  "name": "C++"},
-            {"id": "4",  "name": "SQL"},
-            {"id": "5",  "name": "Frontend (HTML, CSS, JavaScript)"},
-            {"id": "6",  "name": "Backend (REST APIs, HTTP, Django/Node)"},
-            {"id": "7",  "name": "DevOps and Cloud"},
-            {"id": "8",  "name": "Machine Learning"},
-            {"id": "9",  "name": "Data Science and Statistics"},
-            {"id": "10", "name": "Cybersecurity"},
-            {"id": "11", "name": "Operating Systems"},
-            {"id": "12", "name": "Computer Networks"},
-            {"id": "13", "name": "Mobile Development (Android/iOS)"},
-            {"id": "14", "name": "Software Testing and QA"},
-            {"id": "15", "name": "System Design"},
-            {"id": "16", "name": "Data Structures and Algorithms"}
-        ],
-        "custom_topic_allowed": True,
-        "note": "You can pass any topic name directly in /start?topic=YourTopic"
-    }
 
 # ─── START INTERVIEW ──────────────────────────────────────
 @app.post("/start")
 def start_interview(student_name: str, topic: str = "Python"):
     session_id = str(uuid.uuid4())
+    # Persist session immediately so an early /stop can find it.
+    sessions_store[session_id] = {
+        "session_id": session_id,
+        "student_name": student_name,
+        "status": "starting",
+        "question": "",
+        "level": "",
+        "question_num": 0,
+        "topic": topic,
+        "timestamp": datetime.now().isoformat(),
+    }
 
     def run():
         run_interview(student_name, session_id, from_api=True, topic=topic)
@@ -101,22 +95,22 @@ def submit_answer(student_name: str = None, session_id: str = None, answer: str 
 
     state = sessions_store.get(resolved_session)
 
-    # 🛑 check لو السيشن مش موجود
+    # Reject unknown sessions.
     if not state:
         return {"error": "Session not found"}
 
-    # 🛑 check هل فعلاً مستني إجابة؟
+    # Accept answers only while recording.
     if state.get("status") != "recording":
         return {
             "error": "Not accepting answers right now",
             "current_status": state.get("status")
         }
 
-    # 🛑 check لو الإجابة فاضية
+    # Reject empty payloads.
     if not answer.strip():
         return {"error": "Empty answer not allowed"}
 
-    # ✅ تخزين الإجابة
+    # Store trimmed answer.
     with answers_lock:
         answers_store[resolved_session] = answer.strip()
 
@@ -131,8 +125,8 @@ def get_results(student_name: str):
         results = []
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             for line in f:
-                parts = line.strip().split(" | ")
-                if len(parts) >= 9 and parts[1] == student_name:
+                parts = line.strip().split(" | ", maxsplit=9)
+                if len(parts) >= 10 and parts[1] == student_name:
                     results.append({
                         "timestamp": parts[0],
                         "student": parts[1],
@@ -142,7 +136,8 @@ def get_results(student_name: str):
                         "question": parts[5],
                         "answer": parts[6],
                         "elapsed": parts[7],
-                        "adapted": parts[8] if len(parts) > 8 else "",
+                        "adapted": parts[8],
+                        "reason": parts[9],
                     })
         return {"student": student_name, "results": results}
     except Exception:
@@ -153,12 +148,14 @@ def stop_interview(session_id: str):
     state = sessions_store.get(session_id)
 
     if not state:
-        return {"error": "Session not found"}
+        return {"error": "Session not found", "stopped": False}
 
-    # نغير الحالة
+    # Mark interview as stopped and persist to backing store.
     state["status"] = "stopped"
+    sessions_store[session_id] = state
 
     return {
         "message": "Interview stopped",
-        "session_id": session_id
+        "session_id": session_id,
+        "stopped": True,
     }

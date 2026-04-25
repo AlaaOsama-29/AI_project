@@ -33,6 +33,16 @@ def _normalize_api_key(raw):
     return s.strip()
 
 
+def _sanitize_log_field(value):
+    """Keep log records single-line and delimiter-safe."""
+    if value is None:
+        return ""
+    text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ")
+    text = text.replace(" | ", " / ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def get_time_limit(level):
     if level == "Easy":
         return 20
@@ -590,6 +600,11 @@ def write_state(status, q_num=0, question="", level="", name="", session_id="", 
     )
 # ─── Log ──────────────────────────────────────────────────
 def save_log(name, q_num, question, level, topic, answer, elapsed, adapted, reason):
+    name = _sanitize_log_field(name)
+    question = _sanitize_log_field(question)
+    topic = _sanitize_log_field(topic)
+    answer = _sanitize_log_field(answer)
+    reason = _sanitize_log_field(reason)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(
             f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | "
@@ -673,6 +688,11 @@ def get_answer(spk, question, q_num, level, time_limit, student_name="", session
         repeat_count = 0
 
         while (time.perf_counter() - start - paused_time) < time_limit:
+            # Allow API stop requests to terminate the interview immediately.
+            state = sessions_store.get(session_id)
+            if state and state.get("status") == "stopped":
+                return "", 0
+
             with answers_lock:
                 answer = answers_store.pop(session_id, None)
 
@@ -796,15 +816,27 @@ def print_summary(name, total_time, results):
 # ─── Main ─────────────────────────────────────────────────
 def run_interview(student_name: str = None, session_id: str = "", from_api: bool = False, topic: str = ""):
 
+    if session_id:
+        existing_state = sessions_store.get(session_id)
+        if existing_state and existing_state.get("status") == "stopped":
+            _log("INFO", "Interview was stopped before start")
+            return
+
     spk           = setup_speaker()
     total         = 5
     results       = []
     history       = []
     current_level = "Medium"
     arrow         = ""
+    q_num         = 0
 
     _banner("AI TECHNICAL INTERVIEWER", "cyan")
     speak(spk, "Welcome to your technical interview.")
+    if session_id:
+        current_state = sessions_store.get(session_id)
+        if current_state and current_state.get("status") == "stopped":
+            _log("INFO", "Interview stopped by user")
+            return
     write_state("idle", session_id=session_id)
 
     if student_name:
@@ -910,7 +942,7 @@ def run_interview(student_name: str = None, session_id: str = "", from_api: bool
         answer, elapsed = get_answer(spk, question, q_num, level, time_limit,
                                      student_name=name, session_id=session_id, from_api=from_api)
 
-        # ضيفي السطرين دول
+        # Allow graceful stop when interactive input is interrupted.
         if answer == "" and elapsed == 0:
             break
         write_state("waiting", q_num, question, level, name, session_id, topic)
