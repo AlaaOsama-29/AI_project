@@ -1,0 +1,5 @@
+.env
+venv/
+__pycache__/
+session_history.json
+interview_report.txt
