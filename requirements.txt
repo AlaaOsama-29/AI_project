@@ -3,3 +3,9 @@ python-dotenv
 fastapi
 uvicorn
 requests
+pyaudio
+groq
+webrtcvad-wheels
+opencv-python
+pygame
+numpy
